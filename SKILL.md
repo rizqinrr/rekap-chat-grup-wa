@@ -1,117 +1,207 @@
 ---
 name: whatsapp-group-summary-bot
-description: Setup WhatsApp group summary bot — records all messages silently via patched bridge+adapter, reads from JSONL logs, sends structured twice-daily summaries (07:00 & 23:00 WIB) in clean format (italic headers, bold topics, skip empty sections, casual Indonesian).
+version: 1.0.0
+description: "Silent WhatsApp group chat summary bot for Hermes Agent."
+author: Hermes Agent
+authority: user
+license: MIT
+metadata:
+  hermes:
+    tags: [whatsapp, group-chat, summary, bot, cron, messaging]
+    related_skills: [hermes-agent]
 triggers:
-  - User wants auto-summary or "ringkasan" for WhatsApp group
-  - User shares WhatsApp group invite link with summary request
-  - User says "set summary" or "summary bot" in group/DM
+  - User wants WhatsApp group chat summaries/rekap
+  - User mentions 'ringkasan grup wa', 'rekap chat', 'summary bot'
+  - User shares a WhatsApp group and wants auto-summary
 ---
+
+## When to Use
+
+Use this skill when the user wants automatic WhatsApp group chat summaries delivered on a schedule. The bot records messages silently and only responds when mentioned, so it does not disrupt chat.
 
 # WhatsApp Group Summary Bot
 
-Two parts: **(A) message recording** via patched bridge/adapter → JSONL, **(B) cron jobs** that read JSONL and deliver summaries.
+Record all group messages silently to JSONL, then deliver structured Indonesian summaries via cron jobs. Hermes v0.22.5+ supports this via config + one bridge patch; no Python source edits required.
 
-⚠️ **Core patches required.** WhatsApp normally only forwards @mentioned or whitelisted-user messages. Three source files must be patched to record ALL messages silently. Patches WILL be overwritten on `hermes update` — re-apply after updates.
+## Operator Confirmation Gate
 
-## Quick Install
+This user does not want blind execution. Before changing `.env`, patching bridge scripts, or restarting services, present the planned change and wait for explicit confirmation (acc). Proceed only after the user says yes.
+
+When the work touches several places, the plan must name **each file/path that will change, what changes there, and what is deliberately left alone** — this operator asks "bakal ngerubah apa di mana" before approving. Approval is per item, not blanket: a go-ahead for one script or job does not authorize the next one, so ask again before adding another. Keep the proposal short enough to answer with one word.
+
+## Prerequisites
+
+- Hermes Agent installed and gateway running
+- WhatsApp paired via `hermes whatsapp` (bot or self-chat mode)
+- Node.js and npm available in PATH
+- Git available
+- A separate terminal for gateway restart
+
+## Procedure
+
+### 1. Install the skill repo
 
 ```bash
-npx whatsapp-group-summary          # ⚡ auto-detect Hermes + check patches
-hermes skills install whatsapp-group-summary  # 🎯 Hermes CLI
+mkdir -p ~/.hermes/skills
+git clone https://github.com/rizqinrr/rekap-chat-grup-wa.git ~/.hermes/skills/whatsapp-group-summary-bot
 ```
-Repo: https://github.com/mocasus/whatsapp-group-summary
 
----
+If the user already cloned it elsewhere, move or symlink it into `~/.hermes/skills/whatsapp-group-summary-bot`.
 
-## Part A: Message Recording (One-Time Setup)
+### 2. Set required environment variables
 
-### A1. Bridge — `bridge.js`
+`WHATSAPP_*` vars are read from `.env`, not `config.yaml`. Edit `.env` directly. On Docker installs, `.env` lives at `$HERMES_HOME/.env` (typically `$HERMES_HOME/.env`).
 
-Patch: `Hermes `scripts/whatsapp-bridge/bridge.js`` ~line 637
+```bash
+# Example .env entries
+WHATSAPP_ENABLED=true
+WHATSAPP_MODE=bot
+WHATSAPP_DM_POLICY=allowlist
+WHATSAPP_GROUP_POLICY=allowlist
+WHATSAPP_GROUP_ALLOWED_USERS=*      # every group; or a comma-separated list of group IDs
+WHATSAPP_REQUIRE_MENTION=true
+# Do NOT set WHATSAPP_ALLOW_ALL or WHATSAPP_ALLOW_ALL_USERS when using allowlist.
+WHATSAPP_ALLOWED_USERS="<comma-separated numbers without +, e.g. 628123456789,628987654321>"
+cron.wrap_response=false
+```
 
-**Before:**
+`WHATSAPP_ALLOWED_USERS` is the access control: only these numbers can use the bot. Phone numbers may include the `@s.whatsapp.net` suffix or be plain digits; the allowlist bridge normalizes both forms. Every group must be admitted by the intake policy before it can be recorded. Prefer `WHATSAPP_GROUP_POLICY=allowlist` with `WHATSAPP_GROUP_ALLOWED_USERS=*` over `open`: `open` refuses to start the gateway unless `WHATSAPP_ALLOW_ALL_USERS=true` (or `GATEWAY_ALLOW_ALL_USERS`) is also set, and that flag opens DMs to everyone. Anything not admitted is dropped as `group_policy_rejected` in the bridge log — before mention filtering, so tagging will not rescue it. Policy table, wildcard behaviour, and symptom→cause: `references/group-policy-and-intake.md`. `WHATSAPP_REQUIRE_MENTION=true` keeps Hermes silent unless mentioned.
+
+### 3. Override the bridge script in HERMES_HOME
+
+In Docker or read-only installs, the bridge under `/opt/hermes/scripts/whatsapp-bridge/` is not writable. Hermes resolves bridge scripts with this precedence:
+
+1. `$HERMES_HOME/scripts/whatsapp-bridge/` (preferred)
+2. Install dir `scripts/whatsapp-bridge/`
+
+On this Docker install, `HERMES_HOME=$HERMES_HOME`. Copy the bridge to the writable location and patch it there:
+
+```bash
+mkdir -p $HERMES_HOME/scripts/whatsapp-bridge
+cp -r /opt/hermes/scripts/whatsapp-bridge/* $HERMES_HOME/scripts/whatsapp-bridge/
+```
+
+### 4. Patch bridge.js for JSONL recording
+
+Edit `~/.hermes/scripts/whatsapp-bridge/bridge.js`. After the empty-message skip block and before `messageStore.remember(msg);`, insert:
+
 ```js
-if (WHATSAPP_DM_POLICY !== 'pairing' && !matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
-```
-**After (add `!isGroup &&`):**
-```js
-if (!isGroup && WHATSAPP_DM_POLICY !== 'pairing' && !matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
-```
-
-### A2. Adapter Logic — `whatsapp_common.py`
-
-Patch: `~/.hermes/hermes-agent/gateway/platforms/whatsapp_common.py` ~lines 361-365
-
-Remove the group allowlist check — replace with comment noting the patch.
-
-### A3. Silent Recorder — `adapter.py`
-
-Patch: `~/.hermes/hermes-agent/plugins/platforms/whatsapp/adapter.py`
-
-Add method before `_build_message_event`:
-```python
-def _record_group_message_sync(self, data):
-    try:
-        import json, os
-        chat_id = str(data.get("chatId") or "")
-        if not chat_id.endswith("@g.us"): return
-        body = str(data.get("body") or "").strip()
-        if not body: return
-        log_dir = os.path.expanduser("~/.hermes/platforms/whatsapp/group_logs")
-        os.makedirs(log_dir, exist_ok=True)
-        entry = {"ts": data.get("timestamp", 0), "sender": str(data.get("senderName") or data.get("senderId") or ""), "body": body}
-        with open(os.path.join(log_dir, f"{chat_id}.jsonl"), "a") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception: pass
+if (isGroup && event.body && event.body.trim()) {
+  try {
+    // bridge.js is an ES module (it uses `import`), so CommonJS `require()` is
+    // UNDEFINED here — it throws ReferenceError, the catch below swallows it, and
+    // you get ZERO group_logs files with no error anywhere. Declare these at the
+    // top of the file instead:
+    //   import { mkdirSync, appendFileSync } from 'fs';
+    //   import { join } from 'path';
+    //   import { homedir } from 'os';
+    const logDir = join(homedir(), '.hermes', 'platforms', 'whatsapp', 'group_logs');
+    fs.mkdirSync(logDir, { recursive: true });
+    const logFile = path.join(logDir, chatId + '.jsonl');
+    const entry = {
+      ts: msg.key.timestamp || Date.now(),
+      sender: event.senderName || senderId || '',
+      body: event.body.trim(),
+    };
+    fs.appendFileSync(logFile, JSON.stringify(entry) + '\n');
+  } catch (err) {
+    // never block message processing on logging failure
+  }
+}
 ```
 
-In `_build_message_event`, before `_should_process_message` check:
-```python
-if data.get("isGroup", False):
-    self._record_group_message_sync(data)
+Validate syntax:
+
+```bash
+node --check ~/.hermes/scripts/whatsapp-bridge/bridge.js
 ```
 
-### A4. Env
+### 5. Install bridge dependencies in the overridden dir
 
-Add to the Hermes environment config file:
-
-### A5. Restart
-
-`hermes gateway restart` from **external terminal** (cannot restart from inside gateway).
-
-**Verify:** send test message in any group → `ls ~/.hermes/platforms/whatsapp/group_logs/` should show `<chat_id>.jsonl` with your message.
-See `references/verify-recording.md` for full checklist.
-
-### A6. Reference Files
-
-- `references/bridge-api.md` — bridge HTTP API: group name lookup, recording status
-- `references/verify-recording.md` — step-by-step verification after patch + restart
-
----
-
-## Part B: Cron Jobs
-
-### B1. Get Group Info
-
-- **Invite link**: `curl -sL "URL" | grep -oP '(?<=og:title" content=")[^"]+'`
-- **Group ID**: tag Hermes in group with "apa id grup ini?" — answer `\`<id>@g.us\``, nothing else
-- **User MUST add Hermes to group manually** — invite links don't work for bots
-
-### B2. Create Jobs
-
-| Job | Cron (CST) | WIB |
-|-----|-----------|-----|
-| Morning | `0 8 * * *` | 07:00 |
-| Evening | `0 0 * * *` | 23:00 |
-
-Server timezone = Asia/Shanghai (UTC+8). WIB = UTC+7, so add 1 hour for CST.
-**Always pass `schedule` param** on update — omitting it resets to `0 0 * * *`.
-
-### B3. Cron Prompt
-
-**Normal mode (default):**
+```bash
+cd ~/.hermes/scripts/whatsapp-bridge && npm install
 ```
-Baca ~/.hermes/platforms/whatsapp/group_logs/<CHAT_ID>.jsonl 12 jam. Output:
+
+### 6. Create the group_logs directory
+
+```bash
+mkdir -p ~/.hermes/platforms/whatsapp/group_logs
+```
+
+### 7. Restart gateway from an external terminal
+
+Hermes cannot restart its own gateway from inside a session. Use a separate terminal or SSH.
+
+**Pitfall — s6-overlay containers:** On Docker installs managed by s6-overlay, PID 1 is `s6-svscan` and the gateway is a supervised child, **not** PID 1: it runs in the slot `/run/service/gateway-default` (`run` = `hermes gateway run --replace`), and `systemctl` is unavailable. Restart the container from the host (`docker restart <container>`), or run the gateway restart from a shell **outside** the gateway process — Hermes refuses stop/restart aimed at itself from inside its own process tree. Probe without changing state with `s6-svstat /run/service/gateway-default` (read-only, works as the unprivileged `hermes` user). On plain Linux hosts with systemd, use `systemctl restart hermes-gateway` or `systemctl restart hermes`.
+
+**Pitfall:** Stale bridge processes cause the gateway to restart repeatedly. Before restarting, check `ps aux | grep bridge.js` and kill old bridge processes if logs show "Running bridge is stale".
+
+### 8. Verify bridge health and test delivery
+
+After restart, confirm the bridge is up:
+
+```bash
+curl -s http://localhost:3000/health
+```
+
+Expected: `{"status":"connected",...}`.
+
+Test outbound delivery before creating cron jobs:
+
+```bash
+/opt/hermes/bin/hermes send --to "whatsapp:<group_id>@g.us" "Test koneksi Hermes ✅"
+/opt/hermes/bin/hermes send --to "whatsapp:<your_number>@s.whatsapp.net" "DM test berhasil ✅"
+```
+
+Both must return `sent` before proceeding. If delivery fails, check bridge health, then inspect `$HERMES_HOME/whatsapp/bridge.log` for WhatsApp-specific errors before the Hermes gateway log.
+
+### 9. Pair WhatsApp if not already paired
+
+```bash
+hermes whatsapp
+```
+
+Scan QR from the intended account. For bot mode, use a dedicated number already registered with WhatsApp.
+
+### 10. Diagnose inbound DM and group issues
+
+If DMs are not received:
+- Verify `bridge.log` shows no `EACCES` errors on `$HERMES_HOME/whatsapp/session/*.json`.
+- Check that the sender's number is in `WHATSAPP_ALLOWED_USERS` and that `WHATSAPP_DM_POLICY=allowlist`.
+- Ensure the bridge process can read/write `$HERMES_HOME/whatsapp/session/`.
+
+If groups are rejected:
+- Set `WHATSAPP_GROUP_POLICY=open` or populate `WHATSAPP_GROUP_ALLOWED_USERS`.
+- Look for `group_policy_rejected` events in `$HERMES_HOME/whatsapp/bridge.log`.
+
+### 11. Get group ID and verify recording
+
+Group the policy already admits: tag the bot with `apa id grup ini?` — it replies with the group ID.
+
+Group the policy does **not** admit yet: the message never reaches the model, so tagging gets nothing back. Read the ID off the rejection line the bridge writes to `$HERMES_HOME/whatsapp/bridge.log` — `{"event":"ignored","reason":"group_policy_rejected","chatId":"<group>@g.us"}` — then add that ID to `WHATSAPP_GROUP_ALLOWED_USERS` (or set it to `*`) and restart the gateway.
+
+Send a test message in the group, then verify:
+
+```bash
+ls -la ~/.hermes/platforms/whatsapp/group_logs/
+cat ~/.hermes/platforms/whatsapp/group_logs/<group_id>@g.us.jsonl | tail -5
+```
+
+### 12. Create the summary cron jobs
+
+The container clock is **UTC** (WIB = UTC+7) — confirm with `date +%Z` before
+scheduling, and quote times as UTC in the job description.
+
+Morning (07:00 WIB = 00:00 UTC): schedule `0 0 * * *`
+Evening (23:00 WIB = 16:00 UTC): schedule `0 16 * * *`
+Deliver to `whatsapp:<group_id>@g.us` (one target per job). Confirm each job with an
+explicit schedule change rather than assuming the label — the earlier CST naming in
+this skill was wrong for this image.
+
+Prompt template (normal mode):
+
+```
+Baca ~/.hermes/platforms/whatsapp/group_logs/<GROUP_ID>.jsonl 12 jam. Output:
 
 *Summary General — 12 jam terakhir ‼️*
 
@@ -129,119 +219,57 @@ Baca ~/.hermes/platforms/whatsapp/group_logs/<CHAT_ID>.jsonl 12 jam. Output:
 
 Top senders: Nama (count), ...
 
-ATURAN: Title+headers = *italic single*. Topic titles = **bold double**. Section kosong = HAPUS TOTAL, jangan tulis "Tidak ada...". Nama dari sender. URL lengkap. Bahasa santai. Blank line antar section OK.
+ATURAN: Title+headers = *italic single*. Topic titles = **bold double**. Section kosong = HAPUS TOTAL. Nama dari sender. URL lengkap. Bahasa santai. Blank line antar section OK.
 ```
 
-**Roast mode (🔥 毒舌):**
-```
-Kamu adalah bot ringkasan versi ROAST. HANYA OUTPUT RINGKASAN. Baca ~/.hermes/platforms/whatsapp/group_logs/<CHAT_ID>.jsonl, filter 12 jam. TANPA blank line. Gaya: sarkas, lucu, roasting anggota grup tapi tetap friendly, kayak temen yg galak tapi sayang.
+Roast mode prompt: see `references/roast-mode.md`.
 
-*Summary Roast — 12 jam terakhir 🔥*
-- *Yang Paling Nyablak*
-- [siapa paling rame + roasts ringan]
-- *Drama & Perdebatan*
-- [topik panas dibahas + komentar sarkas]
-- *Receh Tapi Menghibur*
-- [chat random yg lucu/absurd]
-- *Keputusan (yg akhirnya diambil setelah debat panjang)*
-- [keputusan + komentar]
-- *PR Yang Belum Kelar*
-- [Nama]: [action item + roast ringan]
-- *Pertanyaan Nyangkut*
-- [pertanyaan + "ada yg bisa jawab ga nih?"]
-- *Link Berserakan*
-- [Nama]: [desc] — [URL]
+## Access Control
 
-ATURAN: No metadata, no blank line, no job info. Roast friendly — bukan bully. Bahasa Indonesia santai + sarkas.
-```
-
-### B4. Toggle Mode (On/Off)
-
-To switch a group's summary to roast mode:
-```
-cronjob(action='update', job_id='<job_id>', prompt='<roast prompt above>')
-```
-
-To switch back to normal:
-```
-cronjob(action='update', job_id='<job_id>', prompt='<normal prompt above>')
-```
-
-User can say: "ubah MOCA PARTY ke mode roast" or "balikin hd ke normal" — agent updates the 2 cron jobs for that group.
-
-### B5. User Style
-
-- **Casual Indonesian** — "gw", "lo", "dong", "ya", "nih", "rame bahas", "muter di", "belum jelas"
-- **Zero metadata** — no "Cronjob Response", job_id, "Catatan teknis", "To stop..."
-- **Blank lines BETWEEN sections** OK — WhatsApp renders section separation cleanly. No blank lines WITHIN a section.
-- **Section headers: `*italic*`** (single asterisk) — `*Inti Diskusi*`, `*Keputusan*`, `*Pertanyaan*`, `*Link*`
-- **Topic titles: `**bold**`** (double asterisk) — `- **Topik Singkat** — deskripsi 1-2 kalimat`
-- **Empty sections = DELETE entirely** — never write "Tidak ada keputusan formal." Just skip the section.
-- **Direct & short** — user hates verbosity ("ribet"). Never add explanatory notes, setup context, or disclaimers.
-- **Group similar chats** — merge related messages into 3-5 topic bullets under Inti Diskusi, not one bullet per message.
-- **Top senders at the end** — `Top senders: Nama (count), ...`
-- Set `cron.wrap_response: false` in config.yaml to strip Hermes cron delivery headers/footers (`hermes config set cron.wrap_response false`).
-- **Honest about gaps** — write "belum ada jawaban jelas" or "tidak ada solusi valid" when appropriate; never fabricate closure.
-
-### B6. Group Behavior (Anti-Ribet Rule)
-
-When tagged in a WhatsApp group with **"apa id grup ini?"** or similar bare ID request:
-- Reply with **just the ID**: `` `120363XXXXXXX@g.us` `` — no quotes, no bold, just inline code
-- Do NOT add: explanations, "mau dipake buat apa?", skill loading, setup offers, follow-up questions
-- Do NOT load this skill unless explicitly asked to "set summary"
-- Speed > conversation — user finds verbose group responses deeply frustrating ("kenapa responmu ribet?")
-
-### B7. Reference Format
-
-See [references/user-format-reference.md](references/user-format-reference.md) for the user's canonical summary example. Match the tone, grouping style, and section structure from that reference closely.
-
----
+- Only numbers in `WHATSAPP_ALLOWED_USERS` may DM the bot or trigger group responses
+- Group forwarding is controlled by `WHATSAPP_GROUP_POLICY`, not by `WHATSAPP_ALLOWED_USERS`. With `open`, all group messages are recorded. With `allowlist`, only groups in `WHATSAPP_GROUP_ALLOWED_USERS` are forwarded; others appear as `group_policy_rejected` in the bridge log.
+- In groups, intake is gated on the group alone: the DM allowlist does not restrict which group members may address the bot. With a wide-open group policy, any member who mentions it can reach the model; `WHATSAPP_REQUIRE_MENTION=true` still decides when it answers.
+- Each WhatsApp chat (group or DM) is its own Hermes session with its own transcript; memory, skills, `.env`, and the active model are shared across all of them.
+- Hermes responds in groups only when @mentioned or when `WHATSAPP_REQUIRE_MENTION=false`
+- `/sethome` sets the current chat as the default destination for cron/notifications on that platform. Only one home channel per platform; running `/sethome` in another chat replaces the previous one.
 
 ## Pitfalls
 
-| Issue | Fix |
-|-------|-----|
-| Patches overwritten on `hermes update` | Re-apply A1-A3 after update |
-| Gateway restart from inside blocked | Use external SSH terminal |
-| Bridge auto-restarts, Python doesn't | Full `hermes gateway restart` needed for Python changes |
-| JSONL timestamps are UNIX epoch ints | Don't try ISO parsing; compare integer timestamps |
-|| Blank lines in output | Blank lines BETWEEN sections now OK. Use section headers as natural separators. NO blank lines within a section. |
-|| Cron delivery header `Cronjob Response: ...` | Set `cron.wrap_response: false` via `hermes config set cron.wrap_response false`. Applies to ALL cron deliveries. |
-| "Ribet" group responses | When tagged for "apa id grup", reply with just `` `120363XXXX@g.us` `` — no explanation, no skill loading |
-| Non-whitelisted member chat not recording | Verify 3 patches (A1-A3) applied + gateway restarted from external terminal. Bridge auto-restarts but Python adapter needs full `hermes gateway restart` |
-| Summary too verbose / one bullet per message | Merge related chats into 3-5 topic bullets; group by theme, not sender |
-| Group name mislabeled | Use `curl localhost:3000/chat/<id>@g.us` to get real WhatsApp name; user often uses shortened names. After setup, verify all group names match. |
-| Unknown group appears in logs | Query bridge API for group name (`curl localhost:3000/chat/<id>@g.us`), then ask user if they want summary. Only setup if user confirms.
-
----
-
-## Example Output
-
-```
-*Summary General — 12 jam terakhir ‼️*
-
-*Inti Diskusi*
-- **Tools AI & model comparison** — GPT 5.6 Sol, Codex, Claude vs ChatGPT 5 buat slicing UI. DickySusanto dan Pen? dominan.
-- **Token saver repos** — Nado share oh-my-pi-supreme-token-saver, mmoaa share paleo.
-- **Remote access debate** — Tailscale vs NetBird, belum ada kesimpulan jelas.
-
-*Pertanyaan*
-- API Gmaps berbayar atau gratis?
-- Sol udah masuk Codex official atau masih lewat 9router?
-
-*Link*
-- Nado: token saver — github.com/Fernado03/oh-my-pi-supreme-token-saver
-- mmoaa: paleo — github.com/mocasus/paleo
-
-Top senders: DickySusanto (25), Pen? (18), Nado (12), mmoaa (10)
-```
-
----
-
-## Resources
-
-- **GitHub repo:** https://github.com/mocasus/whatsapp-group-summary — standalone repo with full README + installation guide
-- **npm:** `npx whatsapp-group-summary` — one-command installer with patch detection
-- **Publishing guide:** `references/npm-publish.md` — how to publish Hermes skills to npm + Hub
-- **X/Twitter media download:** `references/x-twitter-media-download.md` — fxtwitter API workaround without auth
-- **Skill location:** `~/.hermes/skills/whatsapp-group-summary-bot/SKILL.md`
+- **Python source is not writable in Docker installs.** Patch the bridge script in `$HERMES_HOME/scripts/whatsapp-bridge/` instead; Hermes prefers HERMES_HOME over the install dir. On this Docker install, that is `$HERMES_HOME/scripts/whatsapp-bridge/`.
+- **`npm install` may be unnecessary** if the install dir already has `node_modules` and the bridge can resolve them. Only run `npm install` in the overridden dir if the bridge fails to start with module-not-found errors.
+- **Gateway restart must be external and platform-specific.** Restarting from inside Hermes is blocked (Hermes refuses self-targeted stop/restart). On s6-overlay containers the gateway is a supervised child in `/run/service/gateway-default` — restart the container from the host (`docker restart <container>`), or run the restart from a shell outside the gateway process; `s6-svstat /run/service/gateway-default` is the safe read-only probe. On systemd hosts, use `systemctl restart hermes-gateway` or `systemctl restart hermes`.
+- **Bridge script resolution prefers `$HERMES_HOME/scripts/whatsapp-bridge/`.** On Docker installs, copy the bridge from `/opt/hermes/scripts/whatsapp-bridge/` into `$HERMES_HOME/scripts/whatsapp-bridge/` before patching; the install dir is read-only.
+- **Discover connected groups via `find`.** `find $HERMES_HOME/whatsapp/session -name "sender-key-*" | sed 's/.*sender-key-//g; s/_1--.*//g; s/@g.us//g' | sort -u` lists group IDs the bridge has sender keys for.
+- **Resolve LIDs to phone numbers with `lid-mapping-<identifier>.json`.** Each file under `$HERMES_HOME/whatsapp/session/` maps a LID or phone number to its counterpart. Use `cat $HERMES_HOME/whatsapp/session/lid-mapping-<id>.json` to look up the alias.
+- **Sender-key filenames encode participant device IDs.** The format is `sender-key-<group_id>@g.us--<user_lid>_<device_id>--<counter>.json`. The `device_id` is WhatsApp's internal multi-device identifier, not a phone number.
+- **Stale bridge processes cause repeated gateway restarts.** Before restarting, check `ps aux | grep bridge.js` and kill old bridge processes if the gateway logs show "Running bridge is stale".
+- **`hermes update` overwrites the install dir bridge.** Re-copy and re-patch after every update.
+- **Forget `WHATSAPP_MODE=bot` and the bridge defaults to self-chat.** Set it explicitly.
+- **`WHATSAPP_GROUP_POLICY=disabled` or `pairing` drops all group traffic.** `allowlist` admits only the group IDs listed in `WHATSAPP_GROUP_ALLOWED_USERS` (empty = none allowed, `*` = every group). `open` admits every group but the gateway **refuses to start** unless `WHATSAPP_ALLOW_ALL_USERS=true`/`GATEWAY_ALLOW_ALL_USERS` is set, which also opens DMs — so `allowlist` + `*` is the way to run everywhere with a strict DM allowlist.
+- **A rejected group is rejected before mention detection.** Tagging the bot in a group that is not admitted produces no reply and no error the user can see; check the bridge log for `group_policy_rejected` and the `chatId` in that line before touching mention settings.
+- **Group policy edits need a gateway restart.** The adapter injects the bridge env at spawn time and the plugin has no config watcher, so `.env` changes are inert until the gateway restarts (from an external terminal).
+- **`WHATSAPP_DM_POLICY=pairing` ignores `WHATSAPP_ALLOWED_USERS` for DMs.** Use `allowlist` for strict access.
+- **`event.senderName` exists on the event object, not as a local `senderName` variable** in the bridge's `messages.upsert` handler. Use `event.senderName` when logging from that scope.
+- **`msg.key.timestamp` may be undefined**; fall back to `Date.now()`.
+- **Use `hermes send` for instant delivery tests.** The message is **positional** — `hermes send -t "whatsapp:<chat_id>@g.us" "text"`; there is no `--text` flag and argparse rejects it. `--json` gives machine-checkable output. `hermes send --list` prints only groups and the home channel, so **a DM target appears to be missing but still works** (`<number>@s.whatsapp.net`). Crucially, `sent` means the bridge accepted the message, **not** that it arrived: confirm real delivery from `cron/executions.db` → `delivery_outcome='delivered'` for cron sends, or by asking the operator. A `gateway.mirror: no session found for <jid>` line is bookkeeping, not a delivery failure.
+- **Bridge health endpoint:** `curl -s http://localhost:3000/health` returns JSON with `status`, `queueLength`, `scriptHash`, and `session` path. Use `scriptHash` to detect when the running bridge differs from the patched disk copy.
+- **`hermes config set` does not set `WHATSAPP_*` environment variables.** Those keys are read from `.env` by the bridge plugin, not from `config.yaml`. Edit `.env` directly; on Docker installs that is `$HERMES_HOME/.env`.
+- **`WHATSAPP_ALLOWED_USERS` accepts both plain phone numbers and `@s.whatsapp.net` suffixed IDs.** The allowlist bridge normalizes identifiers by stripping `+`, `:...@`, and `@...` suffixes before matching, so both `628123456789` and `628123456789@s.whatsapp.net` resolve to the same alias.
+- **`WHATSAPP_ALLOW_ALL` or `WHATSAPP_ALLOW_ALL_USERS=true` overrides `WHATSAPP_ALLOWED_USERS` entirely.** Remove both variables when you want strict allowlist behavior; otherwise every number can DM the bot.
+- **`WHATSAPP_ALLOWED_USERS` changes require a gateway restart** to take effect; the bridge reads `.env` at startup.
+- **`.env` is a protected credential file in Docker installs.** The `patch` and `write_file` tools refuse to edit it. Use the `terminal` tool with `cp` + `sed` instead: `cp $HERMES_HOME/.env $HERMES_HOME/.env.bak && sed -i 's/^WHATSAPP_ALLOWED_USERS=.*$/WHATSAPP_ALLOWED_USERS=<nomor-owner>,<nomor-admin-2>,<nomor-admin-3>/' $HERMES_HOME/.env`.
+- **Add custom providers with `hermes config set providers.<name>.<key> <value>`.** This writes to `config.yaml` and is the supported way to register OpenAI-compatible endpoints without hand-editing YAML. If `hermes` is not on PATH, use the absolute path `/opt/hermes/bin/hermes`. The provider entry needs at least `base_url`, `api_mode`, and `key_env`; the actual API key lives in `.env`.
+- **DM decryption failures:** If inbound DMs are not received, check `$HERMES_HOME/whatsapp/session/` file permissions and the bridge log at `$HERMES_HOME/whatsapp/bridge.log` for `EACCES` or `No session found to decrypt message`. The bridge process must be able to read/write session JSON files in that directory.
+- **The JSONL recorder can fail completely silently.** The upstream patch uses `require('fs')` inside `bridge.js`, which is an ES module — `require` is undefined, the error is swallowed by the patch's own `try { } catch { }`, and no `group_logs` file is ever written (the directory is not even created). Symptom: group traffic is answered normally in `gateway.log`, but `group_logs/` stays empty. Verify with `find $HERMES_HOME -type d -name group_logs` (empty dirs = broken) and fix by using top-level ESM imports. Never trust the patch because the file contains the patched block — the block must also *run*.
+- **Verify container timezone before scheduling.** `date +%Z` on this image reports **UTC**, not Asia/Shanghai. WIB = UTC+7, so 07:00 WIB = `0 0 * * *` and 23:00 WIB = `0 16 * * *` in cron. See `references/timezone.md`.
+- **One cron job = one delivery target.** `--deliver` takes a single target, so summarising N groups into their own group chats costs N runs. Budget runs, not features: a single job digesting all groups into one DM is 1 run/day.
+- **Measure the per-run floor before designing.** `hermes -z 'Balik satu kata: ok' --usage-file /tmp/u.json` gives the fixed cost of waking the agent (measured ~13.6k input tokens on this host) — every cron run pays it before reading anything. Fewer runs beats a cheaper model; check `model.default` in `config.yaml` first (this host defaults to a free model, so extra runs cost tokens but not money).
+- **Feed the agent a `--script` digest, never the raw JSONL.** Scripts live under `$HERMES_HOME/scripts/` (resolved as `CRON_DIR.parent/scripts`, e.g. `$HERMES_HOME/scripts/`) and their stdout is injected into the prompt. `--script` takes no arguments, so use one thin wrapper per group that imports a shared `rekap_lib.py`.
+- **Use `[SILENT]` for quiet windows.** The scheduler recognises `[SILENT]` / `SILENT` / `NO_REPLY` (whole response or first/last line) and suppresses delivery while still saving the run for audit. Have the digest print `NO_ACTIVITY` on quiet days and instruct the prompt to answer `[SILENT]`.
+- **Script-only jobs cost zero tokens: `--no-agent`.** With it the script *is* the job — stdout is delivered verbatim and **empty stdout sends nothing**, so a wrapper prints a short report on success and a diagnostic plus non-zero exit on failure. Use it for anything deterministic (backups, watchdogs, pruning) instead of paying the per-run agent floor.
+- **Verify cron delivery in `executions.db`, NOT in `gateway.log`.** Cron sends do not appear as `[Whatsapp] Sending response ...` lines. Read `$HERMES_HOME/cron/executions.db` → `executions.delivery_outcome` (`delivered`) plus the saved `cron/output/<job_id>/<date>.md` run file, which contains the exact delivered text.
+- **Retention policy (this deployment, set by the operator).** Only **links** are kept long-term: they are extracted to `group_logs/links/<chat_id>.jsonl` as `{ts, sender, url, context}` deduped by URL. Plain chat lines are pruned after **3 days**, and `state.db` group sessions are pruned as well. Order is mandatory: archive links in the same pass BEFORE anything is pruned, and prune only AFTER the 07:00 WIB digest job has run — otherwise that morning's digest has no input. When the operator asks "which links were shared in this group", answer from the links archive. A deletion request is executed immediately, no second confirmation, then report exactly what was removed.
+- **Chat is stored in three places, not one.** `group_logs/*.jsonl` (raw recorder), `state.db` `messages` (every group conversation the bot took part in, prunable with `hermes sessions delete`), and `cron/output/<job_id>/*.md` (run records that embed raw chat excerpts). "Delete the chat" must be scoped to all three or it silently survives elsewhere.
+- **`state.db` timestamps are epoch floats, never ISO strings.** `sessions.last_activity_at` and `started_at` hold values like `1793064949.51`. Comparing them against an ISO date string silently matches every row (lexicographic `"1..." < "2..."`), so a "delete sessions older than 3 days" filter written that way destroys ALL group sessions on its first pass. Always compare numerically against `now - days*86400`. Verify with a dry-run before enabling any deletion: the same cutoff returned 5 sessions as a string and 0 as a number.
+- **Attach pruning to existing jobs instead of adding new ones.** The prune pass lives in `rekap_lib.py` and is called by `main()` after `build_digest()`: archive links → build digest → prune chat log → prune `state.db` (guarded by a once-per-day stamp file so only the first of the per-group jobs does it). Digest text is built before anything is deleted, so a same-run prune can never empty that morning's summary. Every prune step is wrapped in `try/except` and prints nothing — stdout of that script is fed into the agent prompt.
+- **Bridge log location:** WhatsApp-specific errors are written to `$HERMES_HOME/whatsapp/bridge.log`, not only to the Hermes gateway log at `$HERMES_HOME/logs/gateways/default/current`. Inspect `bridge.log` first when diagnosing delivery, decryption, or policy issues.
