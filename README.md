@@ -406,3 +406,34 @@ MIT © [mocasus](https://github.com/mocasus)
 <p align="center">
   <sub>Dibuat dengan ☕ dan sedikit roasting 🔥</sub>
 </p>
+
+---
+
+## Penyesuaian di fork ini
+
+Fork ini memuat penyesuaian dari instalasi yang menjalankannya, di luar isi upstream:
+
+| Penyesuaian | Berkas |
+|---|---|
+| Perekam JSONL untuk `bridge.js` — semua pesan grup dicatat ke `$HERMES_HOME/platforms/whatsapp/group_logs/<group-id>.jsonl` | `patches/group-log-recorder.patch` |
+| Pipeline ringkasan tanpa agen (0 token): digest, arsip link, pemangkasan retensi, cap harian | `scripts/rekap_lib.py` |
+| Wrapper cron per grup (contoh, 1 grup) | `scripts/rekap_example.py` |
+| Prosedur operasional 12 langkah + Access Control + Pitfalls | `SKILL.md` |
+| Referensi tambahan: timezone, env vars, kebijakan grup, skema JSONL, mode roast | `references/` |
+
+### Perbedaan penting dari upstream
+
+- **Ringkasan dibuat skrip, bukan prompt agen** — job cron mode `--no-agent`, jadi 0 token per jalan.
+- **Timezone**: container Hermes berjalan pada **UTC**, bukan waktu lokal. Ringkasan 07:00 WIB = `0 0 * * *` UTC.
+- **Retensi**: arsip link disimpan permanen (dedupe per URL); obrolan biasa dipangkas setelah `CHAT_RETENTION_DAYS` hari. Urutan wajib: arsipkan link dulu, baru pangkas.
+- Patch perekam memakai `import` ESM, bukan `require` — di dalam ES module `require('fs')` gagal **tanpa suara**, sehingga berkas log tak pernah terbentuk dan kegagalannya tak terlihat.
+
+### Menerapkan patch perekam
+
+```bash
+cd /opt/hermes     # atau $HERMES_HOME bila bridge di-override ke sana
+git apply patches/group-log-recorder.patch
+# lalu pasang dependensi bridge, siapkan folder group_logs, restart gateway dari terminal luar
+```
+
+Aset upstream (`install.js`, `package.json`, `logo.jpg`, README asli, 7 referensi asli) tidak diubah.
